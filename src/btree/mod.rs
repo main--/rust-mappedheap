@@ -1,6 +1,6 @@
 use super::ExtensibleMapping;
 use extensiblemapping::PageId;
-use futex::RwLock;
+use futex::{RwLock, RwLockWriteGuard};
 use std::fs::File;
 use std::mem;
 
@@ -16,13 +16,6 @@ pub struct MappedBTree {
 
 const ROOT_PAGE: PageId = 1;
 type BTreePage = RwLock<BTreePageInner>;
-
-#[repr(u16)]
-enum BTreePageInner {
-    #[allow(dead_code)] // compiler doesnt know shit actually
-    Leaf(LeafNode),
-    Inner(InnerNode),
-}
 
 impl MappedBTree {
     pub fn open(file: File) -> MappedBTree {
@@ -58,68 +51,7 @@ impl MappedBTree {
     }
 
     pub fn try_insert(&self, key: u64, val: u64) -> bool {
-        fn is_full(page: &BTreePageInner) -> bool {
-            match page {
-                &Inner(ref i) => i.full(),
-                &Leaf(ref l) => l.full(),
-            }
-        }
-        
-        let mut path = Vec::new();
-        let mut current = ROOT_PAGE;
-        let mut go = true;
-        while go {
-            let lock = self.page(current).unwrap().read();
-            let previd = current;
-            match *lock {
-                Inner(ref i) => current = i.traverse(key),
-                Leaf(_) => go = false,
-            }
-            path.push((previd, lock));
-        }
-
-        let mut i_first_nonfull;
-        let mut split_root = false;
-        let parent;
-        loop {
-            i_first_nonfull = path.iter().rposition(|x| !is_full(&*x.1))
-                .unwrap_or_else(|| { split_root = true; 0 });
-            let first_nonfull = path.remove(i_first_nonfull).0; // release read lock
-
-            // jaro fix 1
-            path.truncate(i_first_nonfull);
-            
-            let write = self.page(first_nonfull).unwrap().write();
-            if split_root || !is_full(&*write) {
-                parent = (write, first_nonfull);
-                break;
-            }
-        }
-
-        // finally found a parent we (probably) don't have to split
-        // only keep read locks from there to root as well as this write lock
-        //path.truncate(i_first_nonfull);
-        // now writelock our path to the leaf
-        let mut wpath = Vec::new();
-        let (mut current, mut current_id) = parent;
-        loop {
-            let next_id = match *current {
-                Inner(ref i) => i.traverse(key),
-                Leaf(_) => break,
-            };
-            let next = self.page(next_id).unwrap().write();
-            wpath.push((mem::replace(&mut current, next), mem::replace(&mut current_id, next_id)));
-        }
-
-        // right now, current is the leaf
-        // wpath contains writelocks at least up to the last one we have to touch
-        // path contains readlocks above that
-        wpath.push((current, current_id));
-
-        // start by releasing writelocks that turned out to be unnecessary due to races
-        if let Some(actual_first_nonfull) = wpath.iter().rposition(|x| !is_full(&*x.0)) {
-            wpath.drain(..actual_first_nonfull);
-        }
+        let (mut wpath, split_root) = self.wlock_subtree(key, |x| !x.full());
 
         let root_bonus = if split_root { 2 } else { 0 };
         // alloc new pages
@@ -139,47 +71,25 @@ impl MappedBTree {
         // run the split ops
         let mut key = key;
         let mut page_ref = None;
-        for (j, ((mut old, _), &new)) in wpath.drain(1..).rev().zip(newpages.iter()).enumerate() {
-            let mut newlock = self.page(new).unwrap().write();
-            match *old {
-                Inner(ref mut i) => {
-                    assert_ne!(j, 0);
-                    assert!(i.full());
-
-                    *newlock = Inner(i.split(&mut key, page_ref.unwrap(), new).into());
-                }
-                Leaf(ref mut l) => {
-                    assert_eq!(j, 0);
-                    assert!(l.full());
-
-                    *newlock = Leaf(l.split(&mut key, val, new).into());
-                }
-            }
+        for (mut old, &new) in wpath.drain(1..).rev().zip(newpages.iter()) {
+            self.split_into(&mut key, val, page_ref, &mut *old, new);
             page_ref = Some(new);
         }
 
         // splits are done, register the last one or split root
-        assert!(wpath.len() == 1);
-        let (mut page, page_id) = wpath.remove(0);
+        debug_assert!(wpath.len() == 1);
+        let mut page = wpath.remove(0);
         if split_root {
-            assert_eq!(page_id, ROOT_PAGE);
             let newpagel_id = newpages[newpages.len() - 1];
             let newpager_id = newpages[newpages.len() - 2];
+
+            // root page always has to contain the root node
+            // so we juggle the old root node to a new page
             let mut newpagel = self.page(newpagel_id).unwrap().write();
-            let mut newpager = self.page(newpager_id).unwrap().write();
             *newpagel = mem::replace(&mut *page, unsafe { mem::zeroed() });
-            match *newpagel {
-                Inner(ref mut l) => {
-                    assert!(l.full());
-
-                    *newpager = Inner(l.split(&mut key, page_ref.unwrap(), newpager_id).into());
-                }
-                Leaf(ref mut l) => {
-                    assert!(l.full());
-
-                    *newpager = Leaf(l.split(&mut key, val, newpager_id).into());
-                }
-            }
+            // from there, split it to the other new page
+            self.split_into(&mut key, val, page_ref, &mut *newpagel, newpager_id);
+            // and finally create a new root node from scratch
             let mut tmp = InnerNodeActual::new(newpagel_id);
             tmp.insert(key, newpager_id);
             *page = Inner(tmp.into());
@@ -191,10 +101,105 @@ impl MappedBTree {
         }
         true
     }
+
+    /// Descends to the node (readlocks) containing the given key, then
+    /// back up until we manage to write-lock a node that satisfies pred,
+    /// THEN back down from there.
+    /// Finally, we re-check the predicate an drop some of the upper
+    /// locks if it turns out we didn't need them after all.
+    fn wlock_subtree<F: Fn(&BTreePageInner) -> bool>(&self, key: u64, pred: F)
+                                                     -> (Vec<RwLockWriteGuard<BTreePageInner>>, bool) {
+        let mut path = Vec::new();
+        let mut current = ROOT_PAGE;
+        let mut go = true;
+        while go {
+            let lock = self.page(current).unwrap().read();
+            let previd = current;
+            match *lock {
+                Inner(ref i) => current = i.traverse(key),
+                Leaf(_) => go = false,
+            }
+            path.push((previd, lock));
+        }
+
+        let mut hit_root = false;
+        let parent;
+        loop {
+            let o_first_match = path.iter().rposition(|x| pred(&x.1));
+            hit_root = o_first_match.is_none();
+            let i_first_match = o_first_match.unwrap_or(0);
+
+
+            // release read lock ...
+            let first_match = path.swap_remove(i_first_match).0;
+            // ... and all below this one
+            // (may only ever lock downwards)
+            path.truncate(i_first_match);
+
+            let write = self.page(first_match).unwrap().write();
+            if hit_root || pred(&*write) {
+                parent = write;
+                break;
+            }
+        }
+
+        // now wlock back down to the leaf
+        let mut wpath = Vec::new();
+        let mut current = parent;
+        while let Some(next_id) = current.traverse(key) {
+            let next = self.page(next_id).unwrap().write();
+            wpath.push(mem::replace(&mut current, next));
+        }
+
+        // right now, current is the leaf
+        // wpath contains writelocks at least up to the first match
+        // path contains all readlocks right above that TODO: why are we even holding those
+        wpath.push(current);
+
+        // start by releasing writelocks that turned out to be unnecessary due to races
+        if let Some(actual_first_match) = wpath.iter().rposition(|x| pred(&*x)) {
+            wpath.drain(..actual_first_match);
+
+            // if we initially hit the root but now found out that we no longer do
+            // => reset the flag
+            hit_root = false;
+        }
+
+        (wpath, hit_root)
+    }
+
+    fn split_into(&self, key: &mut u64, val: u64, page_ref: Option<PageId>,
+                  page: &mut BTreePageInner, target_id: PageId) {
+        let mut target = self.page(target_id).unwrap().write();
+        *target = match *page {
+            Inner(ref mut l) => Inner(l.split(key, page_ref.unwrap(), target_id).into()),
+            Leaf(ref mut l) => Leaf(l.split(key, val, target_id).into()),
+        }
+    }
 }
 
+#[repr(u16)]
+enum BTreePageInner {
+    #[allow(dead_code)] // compiler doesnt know shit actually
+    Leaf(LeafNode),
+    Inner(InnerNode),
+}
 
+impl BTreePageInner {
+    fn full(&self) -> bool {
+        match self {
+            &Inner(ref i) => i.full(),
+            &Leaf(ref l) => l.full(),
+        }
+    }
 
+    fn traverse(&self, key: u64) -> Option<PageId> {
+        match *self {
+            Inner(ref i) => Some(i.traverse(key)),
+            Leaf(_) => None,
+        }
+    }
+}
 
 
 
