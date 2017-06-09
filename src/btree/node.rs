@@ -132,6 +132,12 @@ pub struct LeafNode {
     next: PageId,
 }
 
+impl LeafNode {
+    pub fn get(&self, key: u64) -> Option<u64> {
+        self.keys().binary_search(&key).ok().map(|i| self.data[i])
+    }
+}
+
 impl Node<u64> for LeafNode {
     #[cfg(test)]
     fn debug(&self) {

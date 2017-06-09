@@ -1,18 +1,28 @@
 use super::ExtensibleMapping;
 use extensiblemapping::PageId;
 use futex::RwLock;
-use std::mem;
 use std::fs::File;
-use std::ops::{Deref, DerefMut};
+use std::mem;
 
 mod node;
-use self::node::{Node, InnerNode as InnerNodeActual, LeafNode as LeafNodeActual};
+mod ugly_hack;
+use self::node::Node;
+use self::ugly_hack::*;
+use self::BTreePageInner::*;
 
 pub struct MappedBTree {
     mapping: ExtensibleMapping
 }
 
 const ROOT_PAGE: PageId = 1;
+type BTreePage = RwLock<BTreePageInner>;
+
+#[repr(u16)]
+enum BTreePageInner {
+    #[allow(dead_code)] // compiler doesnt know shit actually
+    Leaf(LeafNode),
+    Inner(InnerNode),
+}
 
 impl MappedBTree {
     pub fn open(file: File) -> MappedBTree {
@@ -31,9 +41,8 @@ impl MappedBTree {
         loop {
             let lock = self.page(current).unwrap().read();
             match *lock {
-                BTreePageInner::Inner(ref i) => current = i.traverse(key),
-                BTreePageInner::Leaf(ref l) =>
-                    return l.keys().iter().position(|&x| x == key).map(|i| l.content()[i]),
+                Inner(ref i) => current = i.traverse(key),
+                Leaf(ref l) => return l.get(key),
             }
             _prev = lock;
         }
@@ -43,16 +52,16 @@ impl MappedBTree {
     fn debug_print(&self, id: PageId) {
         let lock = self.page(id).unwrap().read();
         match *lock {
-            BTreePageInner::Inner(ref i) => i.debug(),
-            BTreePageInner::Leaf(ref l) => l.debug(),
+            Inner(ref i) => i.debug(),
+            Leaf(ref l) => l.debug(),
         }
     }
 
     pub fn try_insert(&self, key: u64, val: u64) -> bool {
         fn is_full(page: &BTreePageInner) -> bool {
             match page {
-                &BTreePageInner::Inner(ref i) => i.full(),
-                &BTreePageInner::Leaf(ref l) => l.full(),
+                &Inner(ref i) => i.full(),
+                &Leaf(ref l) => l.full(),
             }
         }
         
@@ -63,8 +72,8 @@ impl MappedBTree {
             let lock = self.page(current).unwrap().read();
             let previd = current;
             match *lock {
-                BTreePageInner::Inner(ref i) => current = i.traverse(key),
-                BTreePageInner::Leaf(_) => go = false,
+                Inner(ref i) => current = i.traverse(key),
+                Leaf(_) => go = false,
             }
             path.push((previd, lock));
         }
@@ -95,8 +104,8 @@ impl MappedBTree {
         let (mut current, mut current_id) = parent;
         loop {
             let next_id = match *current {
-                BTreePageInner::Inner(ref i) => i.traverse(key),
-                BTreePageInner::Leaf(_) => break,
+                Inner(ref i) => i.traverse(key),
+                Leaf(_) => break,
             };
             let next = self.page(next_id).unwrap().write();
             wpath.push((mem::replace(&mut current, next), mem::replace(&mut current_id, next_id)));
@@ -133,17 +142,17 @@ impl MappedBTree {
         for (j, ((mut old, _), &new)) in wpath.drain(1..).rev().zip(newpages.iter()).enumerate() {
             let mut newlock = self.page(new).unwrap().write();
             match *old {
-                BTreePageInner::Inner(ref mut i) => {
+                Inner(ref mut i) => {
                     assert_ne!(j, 0);
                     assert!(i.full());
 
-                    *newlock = BTreePageInner::Inner(i.split(&mut key, page_ref.unwrap(), new).into());
+                    *newlock = Inner(i.split(&mut key, page_ref.unwrap(), new).into());
                 }
-                BTreePageInner::Leaf(ref mut l) => {
+                Leaf(ref mut l) => {
                     assert_eq!(j, 0);
                     assert!(l.full());
 
-                    *newlock = BTreePageInner::Leaf(l.split(&mut key, val, new).into());
+                    *newlock = Leaf(l.split(&mut key, val, new).into());
                 }
             }
             page_ref = Some(new);
@@ -160,24 +169,24 @@ impl MappedBTree {
             let mut newpager = self.page(newpager_id).unwrap().write();
             *newpagel = mem::replace(&mut *page, unsafe { mem::zeroed() });
             match *newpagel {
-                BTreePageInner::Inner(ref mut l) => {
+                Inner(ref mut l) => {
                     assert!(l.full());
 
-                    *newpager = BTreePageInner::Inner(l.split(&mut key, page_ref.unwrap(), newpager_id).into());
+                    *newpager = Inner(l.split(&mut key, page_ref.unwrap(), newpager_id).into());
                 }
-                BTreePageInner::Leaf(ref mut l) => {
+                Leaf(ref mut l) => {
                     assert!(l.full());
 
-                    *newpager = BTreePageInner::Leaf(l.split(&mut key, val, newpager_id).into());
+                    *newpager = Leaf(l.split(&mut key, val, newpager_id).into());
                 }
             }
             let mut tmp = InnerNodeActual::new(newpagel_id);
             tmp.insert(key, newpager_id);
-            *page = BTreePageInner::Inner(tmp.into());
+            *page = Inner(tmp.into());
         } else {
             match *page {
-                BTreePageInner::Inner(ref mut i) => i.insert(key, page_ref.unwrap()),
-                BTreePageInner::Leaf(ref mut l) => l.insert(key, val),
+                Inner(ref mut i) => i.insert(key, page_ref.unwrap()),
+                Leaf(ref mut l) => l.insert(key, val),
             }
         }
         true
@@ -185,68 +194,11 @@ impl MappedBTree {
 }
 
 
-type BTreePage = RwLock<BTreePageInner>;
-
-
-// beware ugly hacks because there are no packed enums
-struct InnerNode {
-    // keys: [u64; 255],
-    // children: [PageId; 256],
-    _rustc_pls_trust_me_when_i_say_i_know_the_right_alignment: [u8; 2 + (255 + 256) * 8],
-}
-
-impl Deref for InnerNode {
-    type Target = InnerNodeActual;
-
-    fn deref(&self) -> &InnerNodeActual {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-impl DerefMut for InnerNode {
-    fn deref_mut(&mut self) -> &mut InnerNodeActual {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-impl From<InnerNodeActual> for InnerNode {
-    fn from(cool: InnerNodeActual) -> InnerNode {
-        unsafe { mem::transmute(cool) }
-    }
-}
-
-struct LeafNode {
-    _rustc_pls_trust_me_when_i_say_i_know_the_right_alignment: [u8; 2 + (255 + 256) * 8],
-}
-
-impl Deref for LeafNode {
-    type Target = LeafNodeActual;
-
-    fn deref(&self) -> &LeafNodeActual {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-impl DerefMut for LeafNode {
-    fn deref_mut(&mut self) -> &mut LeafNodeActual {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-impl From<LeafNodeActual> for LeafNode {
-    fn from(cool: LeafNodeActual) -> LeafNode {
-        unsafe { mem::transmute(cool) }
-    }
-}
 
 
 
-#[repr(u16)]
-enum BTreePageInner {
-    #[allow(dead_code)] // compiler doesnt know shit actually
-    Leaf(LeafNode),
-    Inner(InnerNode),
-}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -295,8 +247,8 @@ mod tests {
         {
             fn is_full(page: &BTreePageInner) -> bool {
                 match page {
-                    &BTreePageInner::Inner(ref i) => i.full(),
-                    &BTreePageInner::Leaf(ref l) => l.full(),
+                    &Inner(ref i) => i.full(),
+                    &Leaf(ref l) => l.full(),
                 }
             }
             let lock = tree.page(2).unwrap().read();
