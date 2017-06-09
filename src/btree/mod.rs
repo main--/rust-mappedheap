@@ -50,22 +50,14 @@ impl MappedBTree {
         }
     }
 
-    pub fn try_insert(&self, key: u64, val: u64) -> bool {
+    pub fn insert(&self, key: u64, val: u64) {
         let (mut wpath, split_root) = self.wlock_subtree(key, |x| !x.full());
 
         let root_bonus = if split_root { 2 } else { 0 };
         // alloc new pages
         let mut newpages = Vec::new();
         for _ in 0..wpath.len() - 1 + root_bonus {
-            if let Some(p) = self.mapping.try_alloc() {
-                newpages.push(p);
-            } else {
-                // not enough memory available - free what we got and start over
-                for p in newpages {
-                    self.mapping.free(p);
-                }
-                return false;
-            }
+            newpages.push(self.mapping.alloc());
         }
 
         // run the split ops
@@ -99,7 +91,6 @@ impl MappedBTree {
                 Leaf(ref mut l) => l.insert(key, val),
             }
         }
-        true
     }
 
     /// Descends to the node (readlocks) containing the given key, then
@@ -122,7 +113,7 @@ impl MappedBTree {
             path.push((previd, lock));
         }
 
-        let mut hit_root = false;
+        let mut hit_root;
         let parent;
         loop {
             let o_first_match = path.iter().rposition(|x| pred(&x.1));
@@ -244,7 +235,7 @@ mod tests {
 
         for i in 1..4096 {
             assert_eq!(tree.get(i), None, "{}", i);
-            assert!(tree.try_insert(i, 1337 + i));
+            tree.insert(i, 1337 + i);
             assert_eq!(tree.get(i), Some(1337 + i));
         }
 
