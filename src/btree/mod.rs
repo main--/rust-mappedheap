@@ -1,9 +1,12 @@
 use super::ExtensibleMapping;
 use extensiblemapping::PageId;
 use futex::RwLock;
-use std::{mem, ptr};
+use std::mem;
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
+
+mod node;
+use self::node::{Node, InnerNode as InnerNodeActual, LeafNode as LeafNodeActual};
 
 pub struct MappedBTree {
     mapping: ExtensibleMapping
@@ -28,10 +31,9 @@ impl MappedBTree {
         loop {
             let lock = self.page(current).unwrap().read();
             match *lock {
-                BTreePageInner::Inner(ref i) =>
-                    current = i.children()[find_slot(i.keys(), key)],
+                BTreePageInner::Inner(ref i) => current = i.traverse(key),
                 BTreePageInner::Leaf(ref l) =>
-                    return l.keys.iter().position(|&x| x == key).map(|i| l.data[i]),
+                    return l.keys().iter().position(|&x| x == key).map(|i| l.content()[i]),
             }
             _prev = lock;
         }
@@ -41,10 +43,8 @@ impl MappedBTree {
     fn debug_print(&self, id: PageId) {
         let lock = self.page(id).unwrap().read();
         match *lock {
-            BTreePageInner::Inner(ref i) =>
-                i.debug(),
-            BTreePageInner::Leaf(ref l) =>
-                l.debug(),
+            BTreePageInner::Inner(ref i) => i.debug(),
+            BTreePageInner::Leaf(ref l) => l.debug(),
         }
     }
 
@@ -63,8 +63,7 @@ impl MappedBTree {
             let lock = self.page(current).unwrap().read();
             let previd = current;
             match *lock {
-                BTreePageInner::Inner(ref i) =>
-                    current = i.children()[find_slot(i.keys(), key)],
+                BTreePageInner::Inner(ref i) => current = i.traverse(key),
                 BTreePageInner::Leaf(_) => go = false,
             }
             path.push((previd, lock));
@@ -96,7 +95,7 @@ impl MappedBTree {
         let (mut current, mut current_id) = parent;
         loop {
             let next_id = match *current {
-                BTreePageInner::Inner(ref i) => i.children()[find_slot(i.keys(), key)],
+                BTreePageInner::Inner(ref i) => i.traverse(key),
                 BTreePageInner::Leaf(_) => break,
             };
             let next = self.page(next_id).unwrap().write();
@@ -138,21 +137,13 @@ impl MappedBTree {
                     assert_ne!(j, 0);
                     assert!(i.full());
 
-                    *newlock = BTreePageInner::Inner(unsafe { mem::zeroed() });
-                    key = match *newlock {
-                        BTreePageInner::Inner(ref mut inner) => i.split(key, page_ref.unwrap(), inner),
-                        _ => { unreachable!(); }
-                    }
+                    *newlock = BTreePageInner::Inner(i.split(&mut key, page_ref.unwrap(), new).into());
                 }
                 BTreePageInner::Leaf(ref mut l) => {
                     assert_eq!(j, 0);
                     assert!(l.full());
 
-                    *newlock = BTreePageInner::Leaf(unsafe { mem::zeroed() });
-                    key = match *newlock {
-                        BTreePageInner::Leaf(ref mut leaf) => l.split(key, val, leaf, new),
-                        _ => { unreachable!(); }
-                    };
+                    *newlock = BTreePageInner::Leaf(l.split(&mut key, val, new).into());
                 }
             }
             page_ref = Some(new);
@@ -172,32 +163,17 @@ impl MappedBTree {
                 BTreePageInner::Inner(ref mut l) => {
                     assert!(l.full());
 
-                    *newpager = BTreePageInner::Inner(unsafe { mem::zeroed() });
-                    key = match *newpager {
-                        BTreePageInner::Inner(ref mut r) => l.split(key, page_ref.unwrap(), r),
-                        _ => { unreachable!(); }
-                    }
+                    *newpager = BTreePageInner::Inner(l.split(&mut key, page_ref.unwrap(), newpager_id).into());
                 }
                 BTreePageInner::Leaf(ref mut l) => {
                     assert!(l.full());
 
-                    *newpager = BTreePageInner::Leaf(unsafe { mem::zeroed() });
-                    key = match *newpager {
-                        BTreePageInner::Leaf(ref mut r) => l.split(key, val, r, newpager_id),
-                        _ => { unreachable!(); }
-                    }
+                    *newpager = BTreePageInner::Leaf(l.split(&mut key, val, newpager_id).into());
                 }
             }
-            *page = BTreePageInner::Inner(unsafe { mem::zeroed() });
-            match *page {
-                BTreePageInner::Inner(ref mut root) => {
-                    root.count_ = 1;
-                    root.keys[0] = key;
-                    root.children[0] = newpagel_id;
-                    root.children[1] = newpager_id;
-                }
-                _ => { unreachable!(); }
-            }
+            let mut tmp = InnerNodeActual::new(newpagel_id);
+            tmp.insert(key, newpager_id);
+            *page = BTreePageInner::Inner(tmp.into());
         } else {
             match *page {
                 BTreePageInner::Inner(ref mut i) => i.insert(key, page_ref.unwrap()),
@@ -208,108 +184,15 @@ impl MappedBTree {
     }
 }
 
-fn find_slot(keys: &[u64], key: u64) -> usize {
-    match keys.binary_search(&key) {
-        Ok(i) => i,
-        Err(i) => i,
-    }
-}
-    
 
 type BTreePage = RwLock<BTreePageInner>;
+
 
 // beware ugly hacks because there are no packed enums
 struct InnerNode {
     // keys: [u64; 255],
     // children: [PageId; 256],
     _rustc_pls_trust_me_when_i_say_i_know_the_right_alignment: [u8; 2 + (255 + 256) * 8],
-}
-
-#[repr(packed)]
-struct InnerNodeActual {
-    count_: u16,
-    keys: [u64; 255],
-    children: [PageId; 256],
-}
-
-impl InnerNodeActual {
-    #[cfg(test)]
-    fn debug(&self) {
-        println!("Leaf n={} {:?} {:?}", self.count(), self.keys(), self.children());
-    }
-
-    fn keys(&self) -> &[u64] {
-        &self.keys[..self.count()]
-    }
-
-    fn children(&self) -> &[PageId] {
-        &self.children[.. self.count() + 1]
-    }
-    
-    fn count(&self) -> usize {
-        self.count_ as usize
-    }
-
-    fn full(&self) -> bool {
-        self.count() == 255
-    }
-
-    fn insert(&mut self, key: u64, newpage: PageId) {
-        assert!(!self.full());
-        
-        let i = find_slot(self.keys(), key);
-        unsafe {
-            ptr::copy(&self.keys[i], &mut self.keys[i + 1], self.count() - i);
-            ptr::copy(&self.children[i], &mut self.children[i + 1], self.count() - i);
-        }
-        self.keys[i] = key;
-        self.children[i+1] = newpage;
-        self.count_ += 1;
-    }
-    
-    fn split(&mut self, newkey: u64, newval: PageId, target: &mut InnerNode) -> u64 {
-        debug_assert!(self.full());
-
-        let mut remain = self.count() / 2;
-        let mut rest = self.count() - remain;
-
-        let i = find_slot(self.keys(), newkey);
-
-        let ret = self.keys[remain];
-        if i > remain {
-            // add to target
-            let before = i - remain - 1;
-            target.keys[..before].copy_from_slice(&self.keys[remain+1..i]);
-            target.children[..before+1].copy_from_slice(&self.children[remain..i]);
-
-
-            target.keys[before] = newkey;
-            target.children[before+1] = newval;
-
-            let after = before + 1;
-            target.keys[after..rest].copy_from_slice(&self.keys()[i..]);
-            target.children[after+1..rest+1].copy_from_slice(&self.children()[i..]);
-        } else {
-            // add to self
-            rest -= 1;
-            target.keys[..rest].copy_from_slice(&self.keys()[remain+1..]);
-            target.children[..rest+1].copy_from_slice(&self.children()[remain..]);
-
-            unsafe {
-                ptr::copy(&self.keys[i], &mut self.keys[i + 1], remain - i);
-                ptr::copy(&self.children[i], &mut self.children[i + 1], remain - i);
-            }
-            self.keys[i] = newkey;
-            self.children[i] = newval;
-            
-            remain += 1;
-        }
-        
-        self.count_ = remain as u16;
-        target.count_ = rest as u16;
-
-        ret
-    }
 }
 
 impl Deref for InnerNode {
@@ -326,101 +209,14 @@ impl DerefMut for InnerNode {
     }
 }
 
+impl From<InnerNodeActual> for InnerNode {
+    fn from(cool: InnerNodeActual) -> InnerNode {
+        unsafe { mem::transmute(cool) }
+    }
+}
+
 struct LeafNode {
-    // keys: [u64; 255],
-    // children: [PageId; 256],
     _rustc_pls_trust_me_when_i_say_i_know_the_right_alignment: [u8; 2 + (255 + 256) * 8],
-}
-
-#[repr(packed)]
-struct LeafNodeActual {
-    count_: u16,
-    keys: [u64; 255],
-    data: [u64; 255],
-    next: PageId,
-}
-
-impl LeafNodeActual {
-    #[cfg(test)]
-    fn debug(&self) {
-        println!("Leaf n={} {:?} {:?} next={}", self.count(), self.keys(), self.data(), self.next);
-    }
-
-    
-    fn keys(&self) -> &[u64] {
-        &self.keys[..self.count()]
-    }
-    
-    fn data(&self) -> &[u64] {
-        &self.data[..self.count()]
-    }
-    
-    fn count(&self) -> usize {
-        self.count_ as usize
-    }
-
-    fn full(&self) -> bool {
-        self.count() == 255
-    }
-
-    fn insert(&mut self, key: u64, val: u64) {
-        assert!(!self.full());
-
-        let i = find_slot(self.keys(), key);
-        unsafe {
-            ptr::copy(&self.keys[i], self.keys.as_mut_ptr().offset(i as isize + 1), self.count() - i);
-            ptr::copy(&self.data[i], self.data.as_mut_ptr().offset(i as isize + 1), self.count() - i);
-        }
-        self.keys[i] = key;
-        self.data[i] = val;
-        self.count_ += 1;
-    }
-
-    fn split(&mut self, newkey: u64, newval: u64, target: &mut LeafNode, target_id: PageId) -> u64 {
-        debug_assert!(self.full());
-
-        let mut remain = self.count() / 2;
-        let mut rest = self.count() - remain;
-
-        let i = find_slot(self.keys(), newkey);
-
-        target.next = self.next;
-        self.next = target_id;
-        
-        if i > remain {
-            // add to target
-            rest += 1;
-
-            let before = i - remain;
-            target.keys[..before].copy_from_slice(&self.keys[remain..i]);
-            target.data[..before].copy_from_slice(&self.data[remain..i]);
-
-            target.keys[i - remain] = newkey;
-            target.data[i - remain] = newval;
-
-            let after = i - remain + 1;
-            target.keys[after..rest].copy_from_slice(&self.keys()[i..]);
-            target.data[after..rest].copy_from_slice(&self.data()[i..]);
-        } else {
-            // add to self
-            target.keys[..rest].copy_from_slice(&self.keys()[remain..]);
-            target.data[..rest].copy_from_slice(&self.data()[remain..]);
-
-            unsafe {
-                ptr::copy(&self.keys[i], &mut self.keys[i + 1], remain - i);
-                ptr::copy(&self.data[i], &mut self.data[i + 1], remain - i);
-            }
-            self.keys[i] = newkey;
-            self.data[i] = newval;
-            
-            remain += 1;
-        }
-        
-        self.count_ = remain as u16;
-        target.count_ = rest as u16;
-
-        target.keys[0]
-    }
 }
 
 impl Deref for LeafNode {
@@ -437,12 +233,18 @@ impl DerefMut for LeafNode {
     }
 }
 
+impl From<LeafNodeActual> for LeafNode {
+    fn from(cool: LeafNodeActual) -> LeafNode {
+        unsafe { mem::transmute(cool) }
+    }
+}
+
 
 
 #[repr(u16)]
 enum BTreePageInner {
+    #[allow(dead_code)] // compiler doesnt know shit actually
     Leaf(LeafNode),
-    #[allow(unused)] // compiler doesnt know shit actually
     Inner(InnerNode),
 }
 
