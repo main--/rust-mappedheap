@@ -1,0 +1,8 @@
+[package]
+name = "mappedheap"
+version = "0.1.0"
+authors = ["main() <main@ehvag.de>"]
+
+[dependencies]
+libc = "0.2"
+futex = { path = "../rust-futex" }
