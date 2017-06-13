@@ -162,7 +162,7 @@ impl MappedBTree {
 
                         (&mut Leaf(ref mut p), &mut Leaf(ref mut s)) => {
                             p.borrow(&mut *parent, slot, s, is_right);
-                            ret = p.remove(key); // TODO return this
+                            ret = p.remove(key);
                         }
                         _ => unreachable!(),
                     };
@@ -208,7 +208,6 @@ impl MappedBTree {
                 } else {
                     self.mapping.free(page_id);
                 }
-                // FIXME free
 
                 last_parent_slot = Some(slot);
             } else {
@@ -216,7 +215,7 @@ impl MappedBTree {
                 match *page {
                     Inner(ref mut i) => { i.remove_idx(last_parent_slot.unwrap()).1; }
                     Leaf(ref mut l) => ret = l.remove(key),
-                }; // FIXME
+                };
                 assert!(ret.is_some());
                 return ret;
             }
