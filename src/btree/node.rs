@@ -8,7 +8,7 @@ pub trait Node<T> : Sized {
     fn content(&self) -> &[T];
     fn count(&self) -> usize;
     fn half_full(&self) -> bool {
-        self.count() == 127
+        self.count() <= 127
     }
     fn full(&self) -> bool {
         self.count() == 255
@@ -85,12 +85,21 @@ impl Node<PageId> for InnerNode {
         assert!(!self.full());
 
         unsafe {
-            ptr::copy(&self.keys[i], &mut self.keys[i + 1], self.count() - i);
-            ptr::copy(&self.children[i + 1], &mut self.children[i + 2], self.count() - i);
+            ptr::copy(&self.keys[i], self.keys.as_mut_ptr().offset(i as isize + 1), self.count() - i);
+            ptr::copy(&self.children[i + 1], self.children.as_mut_ptr().offset(i as isize + 2), self.count() - i);
         }
         self.keys[i] = key;
         self.children[i + 1] = newpage;
         self.count_ += 1;
+    }
+
+    fn remove(&mut self, key: u64) -> Option<u64> {
+        let i = self.find_slot(key);
+        if self.keys()[i] == key {
+            Some(self.remove_idx(i - 1).1)
+        } else {
+            None
+        }
     }
 
     fn remove_idx(&mut self, i: usize) -> (u64, PageId) {
@@ -98,11 +107,11 @@ impl Node<PageId> for InnerNode {
         // have to allow temporarily violation of tree invariants
         // as we have to remove before we can merge inner nodes
 
-        let ret = (self.keys[i - 1], self.children[i]);
+        let ret = (self.keys[i], self.children[i + 1]);
 
         unsafe {
-            ptr::copy(&self.keys[i], &mut self.keys[i - 1], self.count() - i);
-            ptr::copy(&self.children[i + 1], &mut self.children[i], self.count() - i);
+            ptr::copy(&self.keys[i + 1], &mut self.keys[i], self.count() - i);
+            ptr::copy(&self.children[i + 2], &mut self.children[i + 1], self.count() - i);
         }
         self.count_ -= 1;
 
@@ -115,40 +124,43 @@ impl Node<PageId> for InnerNode {
         let newkey = *key;
         let mut target: InnerNode = unsafe { mem::uninitialized() };
 
-        let mut remain = self.count() / 2;
+        let mut remain = (self.count() + 1) / 2;
         let mut rest = self.count() - remain;
 
-        let i = self.find_slot(newkey) - 1;
-        assert_eq!(self.keys[i], newkey);
+        let i = self.find_slot(newkey);
 
-        *key = self.keys[remain];
         if i > remain {
+            *key = self.keys[remain - 1];
             // add to target
-            let before = i - remain - 1;
-            target.keys[..before].copy_from_slice(&self.keys[remain+1..i]);
-            target.children[..before+1].copy_from_slice(&self.children[remain..i]);
+            let before = i - remain;
+            target.keys[..before].copy_from_slice(&self.keys[remain..i]);
+            target.children[..before+1].copy_from_slice(&self.children[remain..i+1]);
 
 
             target.keys[before] = newkey;
             target.children[before+1] = newval;
 
+            // count - i - 1
             let after = before + 1;
-            target.keys[after..rest].copy_from_slice(&self.keys()[i..]);
-            target.children[after+1..rest+1].copy_from_slice(&self.content()[i..]);
+            target.keys[after..rest+1].copy_from_slice(&self.keys()[i..]);
+            target.children[after+1..rest+2].copy_from_slice(&self.content()[i+1..]);
+
+            remain -= 1;
+            rest += 1;
         } else {
+            *key = self.keys[remain];
             // add to self
-            rest -= 1;
-            target.keys[..rest].copy_from_slice(&self.keys()[remain+1..]);
-            target.children[..rest+1].copy_from_slice(&self.content()[remain..]);
+            target.keys[..rest-1].copy_from_slice(&self.keys()[remain+1..]);
+            target.children[..rest].copy_from_slice(&self.content()[remain+1..]);
 
             unsafe {
-                ptr::copy(&self.keys[i], &mut self.keys[i + 1], remain - i);
-                ptr::copy(&self.children[i], &mut self.children[i + 1], remain - i);
+                ptr::copy(&self.keys[i], self.keys.as_mut_ptr().offset(i as isize + 1), remain - i);
+                ptr::copy(&self.children[i + 1], self.children.as_mut_ptr().offset(i as isize + 2), remain - i);
             }
             self.keys[i] = newkey;
-            self.children[i] = newval;
-
+            self.children[i + 1] = newval;
             remain += 1;
+            rest -= 1;
         }
 
         self.count_ = remain as u16;
@@ -170,10 +182,10 @@ impl Node<PageId> for InnerNode {
 
         let (mut k, mut v) = sibling.remove_idx(i_del);
         if is_right {
-            mem::swap(&mut k, &mut parent.keys[parent_slot + 1]);
+            mem::swap(&mut k, &mut parent.keys[parent_slot]);
             mem::swap(&mut v, &mut sibling.children[0]);
         } else {
-            mem::swap(&mut k, &mut parent.keys[parent_slot]);
+            mem::swap(&mut k, &mut parent.keys[parent_slot - 1]);
             mem::swap(&mut v, &mut self.children[0]);
         }
         self.insert_idx(i_ins, k, v);
@@ -332,6 +344,9 @@ impl Node<u64> for LeafNode {
     fn merge(&mut self, sibling: &mut LeafNode, _parent_key: u64) {
         assert!(self.count() + sibling.count() <= self.keys.len());
         assert!(self.keys[0] < sibling.keys[0]);
+        // TODO: this /probably/ needn't hold
+        // but there might be pathological cases where we have to adjust things so it does
+        // assert_eq!(sibling.keys[0], _parent_key);
 
         let count = self.count();
         self.keys[count..][..sibling.count()].copy_from_slice(sibling.keys());

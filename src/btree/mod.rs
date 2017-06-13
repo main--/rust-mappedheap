@@ -112,15 +112,36 @@ impl MappedBTree {
         let mut iter = wpath.into_iter().rev();
         let (mut parent, mut parent_id) = iter.next().unwrap();
         let mut last_parent_slot = None;
-        let mut newroot;
-        let newroot_id;
+
         let mut ret = None;
         loop {
             let mut page = parent;
             let page_id = parent_id;
             let nextparent = iter.next();
             let root_exception = hit_root && nextparent.is_none();
-            if page.half_full() && !root_exception {
+            if page.count() == 1 {
+                // can only happen at root
+                assert!(root_exception);
+
+                // remove
+                let child_id = match *page {
+                    Inner(ref mut inner) => {
+                        inner.remove_idx(last_parent_slot.unwrap());
+                        assert!(inner.count() == 0);
+                        // right now, root is an inner node with only one element
+                        // -> our only child inherits the whole business
+                        inner.content()[0]
+                    }
+                    Leaf(ref mut l) => return l.remove(key), // tree is now empty, everything correct
+                };
+
+                let mut child = self.page(child_id).unwrap().write();
+                *page = mem::replace(&mut *child, unsafe { mem::uninitialized() });
+                drop(child);
+                drop(page);
+                self.mapping.free(child_id);
+                return ret;
+            } else if page.half_full() && !root_exception {
                 // todo iterate one less
                 let nextparent = nextparent.unwrap();
                 parent = nextparent.0;
@@ -130,7 +151,7 @@ impl MappedBTree {
                     Inner(ref mut i) => i,
                     _ => unreachable!(),
                 };
-                let mut slot = parent.find_slot(key);
+                let slot = parent.find_slot(key);
 
                 let mut sibling = None;
                 let mut sibling_id = None;
@@ -150,19 +171,19 @@ impl MappedBTree {
 
                 let mut sibling = match sibling {
                     Some(x) => x,
-                    None => { newroot = page; newroot_id = page_id; break; }
+                    None => unreachable!(),
                 };
                 if !sibling.half_full() {
                     // can borrow
                     match (&mut *page, &mut *sibling) {
                         (&mut Inner(ref mut p), &mut Inner(ref mut s)) => {
-                            p.borrow(&mut *parent, slot, s, is_right);
                             p.remove_idx(last_parent_slot.unwrap());
+                            p.borrow(&mut *parent, slot, s, is_right);
                         }
 
                         (&mut Leaf(ref mut p), &mut Leaf(ref mut s)) => {
-                            p.borrow(&mut *parent, slot, s, is_right);
                             ret = p.remove(key);
+                            p.borrow(&mut *parent, slot, s, is_right);
                         }
                         _ => unreachable!(),
                     };
@@ -170,16 +191,12 @@ impl MappedBTree {
                     return ret;
                 }
 
-                if is_right {
-                    slot += 1;
-                }
-
                 // need to merge
                 match (&mut *page, &mut *sibling) {
                     (&mut Inner(ref mut p), &mut Inner(ref mut s)) => {
                         p.remove_idx(last_parent_slot.unwrap());
                         if is_right {
-                            p.merge(s, parent.keys()[slot - 1]);
+                            p.merge(s, parent.keys()[slot]);
                         } else {
                             s.merge(p, parent.keys()[slot - 1]);
                         }
@@ -192,7 +209,7 @@ impl MappedBTree {
                         }
 
                         if is_right {
-                            p.merge(s, parent.keys()[slot - 1]);
+                            p.merge(s, parent.keys()[slot]);
                         } else {
                             s.merge(p, parent.keys()[slot - 1]);
                         }
@@ -220,19 +237,6 @@ impl MappedBTree {
                 return ret;
             }
         }
-
-        // there is no sibling -> eat root
-        let mut root = parent;
-        assert!(iter.next().is_none());
-        match *root {
-            Inner(..) => (),
-            Leaf(..) => unreachable!(),
-        }
-        *root = mem::replace(&mut *newroot, unsafe { mem::uninitialized() });
-        drop(root);
-        drop(newroot);
-        self.mapping.free(newroot_id);
-        self.remove(key)
     }
 
     /// Descends to the node (readlocks) containing the given key, then
@@ -322,6 +326,13 @@ enum BTreePageInner {
 }
 
 impl BTreePageInner {
+    fn count(&self) -> usize {
+        match self {
+            &Inner(ref i) => i.count(),
+            &Leaf(ref l) => l.count(),
+        }
+    }
+
     fn full(&self) -> bool {
         match self {
             &Inner(ref i) => i.full(),
@@ -373,30 +384,32 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let mut file = OpenOptions::new().read(true).write(true).open("/tmp/btree.bin").unwrap();
+        let mut file = OpenOptions::new().read(true).write(true).open("/dev/shm/btree.bin").unwrap();
         ExtensibleMapping::initialize(&mut file);
         let tree = MappedBTree::open(file);
         assert_eq!(tree.mapping.alloc(), 1); // FIXME
 
-        let range = 1..4096;
+        let range = 1..600000;
+        let mut rng = XorShiftRng::new_unseeded();
 
-        for i in range.clone() {
-            assert_eq!(tree.get(i), None, "{}", i);
-            tree.insert(i, 1337 + i);
-            assert_eq!(tree.get(i), Some(1337 + i));
+        let mut values: Vec<_> = range.clone().collect();
+        rng.shuffle(&mut values);
+
+        for &i in &values {
+            assert_eq!(tree.get(i), None);
+            tree.insert(i, i);
+            assert_eq!(tree.get(i), Some(i));
         }
 
-        for i in range.clone() {
-            assert_eq!(tree.get(i), Some(1337 + i));
+        for &i in &values {
+            assert_eq!(tree.get(i), Some(i));
         }
 
+        rng.shuffle(&mut values);
 
-        let mut values: Vec<_> = range.collect();
-        XorShiftRng::new_unseeded().shuffle(&mut values);
-
-        for i in values {
-            assert_eq!(tree.get(i), Some(1337 + i));
-            assert_eq!(tree.remove(i), Some(1337 + i));
+        for &i in &values {
+            assert_eq!(tree.get(i), Some(i));
+            assert_eq!(tree.remove(i), Some(i));
             assert_eq!(tree.remove(i), None);
             assert_eq!(tree.get(i), None);
         }
