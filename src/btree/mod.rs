@@ -64,13 +64,13 @@ impl MappedBTree {
         // run the split ops
         let mut key = key;
         let mut page_ref = None;
-        for (mut old, &new) in wpath.drain(1..).rev().zip(newpages.iter()) {
+        for ((mut old, _), &new) in wpath.drain(1..).rev().zip(newpages.iter()) {
             self.split_into(&mut key, val, page_ref, &mut *old, new);
             page_ref = Some(new);
         }
 
         // splits are done, register the last one or split root
-        let mut page = wpath.pop().unwrap();
+        let (mut page, _) = wpath.pop().unwrap();
         if split_root {
             let newpagel_id = newpages[newpages.len() - 1];
             let newpager_id = newpages[newpages.len() - 2];
@@ -100,7 +100,7 @@ impl MappedBTree {
 
         // first check if the element even exists
         // bailing out later is kinda hard
-        match **wpath.last().unwrap() {
+        match *wpath.last().unwrap().0 {
             Inner(..) => unreachable!(),
             Leaf(ref l) => {
                 if l.keys().binary_search(&key).is_err() {
@@ -110,17 +110,22 @@ impl MappedBTree {
         }
 
         let mut iter = wpath.into_iter().rev();
-        let mut parent = iter.next().unwrap();
+        let (mut parent, mut parent_id) = iter.next().unwrap();
         let mut last_parent_slot = None;
         let mut newroot;
+        let newroot_id;
         let mut ret = None;
         loop {
             let mut page = parent;
+            let page_id = parent_id;
             let nextparent = iter.next();
             let root_exception = hit_root && nextparent.is_none();
             if page.half_full() && !root_exception {
                 // todo iterate one less
-                parent = nextparent.unwrap();
+                let nextparent = nextparent.unwrap();
+                parent = nextparent.0;
+                parent_id = nextparent.1;
+
                 let parent = match *parent {
                     Inner(ref mut i) => i,
                     _ => unreachable!(),
@@ -128,13 +133,16 @@ impl MappedBTree {
                 let mut slot = parent.find_slot(key);
 
                 let mut sibling = None;
+                let mut sibling_id = None;
                 let mut is_right = false;
 
                 if let Some(&siblingl) = parent.content().get(slot.wrapping_sub(1)) {
+                    sibling_id = Some(siblingl);
                     sibling = Some(self.page(siblingl).unwrap().write());
                 }
                 if sibling.as_ref().map(|x| x.half_full()).unwrap_or(true) {
                     if let Some(&siblingr) = parent.content().get(slot + 1) {
+                        sibling_id = Some(siblingr);
                         sibling = Some(self.page(siblingr).unwrap().write());
                         is_right = true;
                     }
@@ -142,7 +150,7 @@ impl MappedBTree {
 
                 let mut sibling = match sibling {
                     Some(x) => x,
-                    None => { newroot = page; break; }
+                    None => { newroot = page; newroot_id = page_id; break; }
                 };
                 if !sibling.half_full() {
                     // can borrow
@@ -191,6 +199,15 @@ impl MappedBTree {
                     }
                     _ => unreachable!(),
                 }
+
+                drop(sibling);
+                drop(page);
+
+                if is_right {
+                    self.mapping.free(sibling_id.unwrap());
+                } else {
+                    self.mapping.free(page_id);
+                }
                 // FIXME free
 
                 last_parent_slot = Some(slot);
@@ -215,8 +232,8 @@ impl MappedBTree {
         *root = mem::replace(&mut *newroot, unsafe { mem::uninitialized() });
         drop(root);
         drop(newroot);
+        self.mapping.free(newroot_id);
         self.remove(key)
-        // FIXME self.mapping.free(
     }
 
     /// Descends to the node (readlocks) containing the given key, then
@@ -225,7 +242,7 @@ impl MappedBTree {
     /// Finally, we re-check the predicate an drop some of the upper
     /// locks if it turns out we didn't need them after all.
     fn wlock_subtree<F: Fn(&BTreePageInner) -> bool>(&self, key: u64, pred: F)
-                                                     -> (Vec<RwLockWriteGuard<BTreePageInner>>, bool) {
+        -> (Vec<(RwLockWriteGuard<BTreePageInner>, PageId)>, bool) {
         let mut path = Vec::new();
         let mut current = ROOT_PAGE;
         let mut go = true;
@@ -241,6 +258,7 @@ impl MappedBTree {
 
         let mut hit_root;
         let parent;
+        let parent_id;
         loop {
             let o_first_match = path.iter().rposition(|x| pred(&x.1));
             hit_root = o_first_match.is_none();
@@ -256,6 +274,7 @@ impl MappedBTree {
             let write = self.page(first_match).unwrap().write();
             if hit_root || pred(&*write) {
                 parent = write;
+                parent_id = first_match;
                 break;
             }
         }
@@ -263,18 +282,19 @@ impl MappedBTree {
         // now wlock back down to the leaf
         let mut wpath = Vec::new();
         let mut current = parent;
+        let mut current_id = parent_id;
         while let Some(next_id) = current.traverse(key) {
             let next = self.page(next_id).unwrap().write();
-            wpath.push(mem::replace(&mut current, next));
+            wpath.push((mem::replace(&mut current, next), mem::replace(&mut current_id, next_id)));
         }
 
         // right now, current is the leaf
         // wpath contains writelocks at least up to the first match
         // path contains all readlocks right above that TODO: why are we even holding those
-        wpath.push(current);
+        wpath.push((current, current_id));
 
         // start by releasing writelocks that turned out to be unnecessary due to races
-        if let Some(actual_first_match) = wpath.iter().rposition(|x| pred(&*x)) {
+        if let Some(actual_first_match) = wpath.iter().rposition(|x| pred(&x.0)) {
             wpath.drain(..actual_first_match);
 
             // if we initially hit the root but now found out that we no longer do
