@@ -6,3 +6,6 @@ authors = ["main() <main@ehvag.de>"]
 [dependencies]
 libc = "0.2"
 futex = { path = "../rust-futex" }
+
+[dev-dependencies]
+rand = "0.3"

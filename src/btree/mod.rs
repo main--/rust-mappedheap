@@ -42,6 +42,7 @@ impl MappedBTree {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn debug_print(&self, id: PageId) {
         let lock = self.page(id).unwrap().read();
         match *lock {
@@ -69,8 +70,7 @@ impl MappedBTree {
         }
 
         // splits are done, register the last one or split root
-        debug_assert!(wpath.len() == 1);
-        let mut page = wpath.remove(0);
+        let mut page = wpath.pop().unwrap();
         if split_root {
             let newpagel_id = newpages[newpages.len() - 1];
             let newpager_id = newpages[newpages.len() - 2];
@@ -91,6 +91,115 @@ impl MappedBTree {
                 Leaf(ref mut l) => l.insert(key, val),
             }
         }
+    }
+
+    pub fn remove(&self, key: u64) {
+        // FIXME: this is pessimistic - most of these locks are wasted when we can just
+        //        borrow from siblings (avg case)
+        let (wpath, hit_root) = self.wlock_subtree(key, |x| !x.half_full());
+
+        let mut iter = wpath.into_iter().rev();
+        let mut parent = iter.next().unwrap();
+        let mut last_parent_slot = None;
+        let mut newroot;
+        loop {
+            let mut page = parent;
+            let nextparent = iter.next();
+            let root_exception = hit_root && nextparent.is_none();
+            if page.half_full() && !root_exception {
+                // todo iterate one less
+                parent = nextparent.unwrap();
+                let parent = match *parent {
+                    Inner(ref mut i) => i,
+                    _ => unreachable!(),
+                };
+                let mut slot = parent.find_slot(key);
+
+                let mut sibling = None;
+                let mut is_right = false;
+
+                if let Some(&siblingl) = parent.content().get(slot.wrapping_sub(1)) {
+                    sibling = Some(self.page(siblingl).unwrap().write());
+                }
+                if sibling.as_ref().map(|x| x.half_full()).unwrap_or(true) {
+                    if let Some(&siblingr) = parent.content().get(slot + 1) {
+                        sibling = Some(self.page(siblingr).unwrap().write());
+                        is_right = true;
+                    }
+                }
+
+                let mut sibling = match sibling {
+                    Some(x) => x,
+                    None => { newroot = page; break; }
+                };
+                if !sibling.half_full() {
+                    // can borrow
+                    match (&mut *page, &mut *sibling) {
+                        (&mut Inner(ref mut p), &mut Inner(ref mut s)) => {
+                            p.borrow(&mut *parent, slot, s, is_right);
+                            p.remove_idx(last_parent_slot.unwrap());
+                        }
+
+                        (&mut Leaf(ref mut p), &mut Leaf(ref mut s)) => {
+                            p.borrow(&mut *parent, slot, s, is_right);
+                            p.remove(key); // TODO return this
+                        }
+                        _ => unreachable!(),
+                    }
+                    return;
+                }
+
+                if is_right {
+                    slot += 1;
+                }
+
+                // need to merge
+                match (&mut *page, &mut *sibling) {
+                    (&mut Inner(ref mut p), &mut Inner(ref mut s)) => {
+                        p.remove_idx(last_parent_slot.unwrap());
+                        if is_right {
+                            p.merge(s, parent.keys()[slot - 1]);
+                        } else {
+                            s.merge(p, parent.keys()[slot - 1]);
+                        }
+                    }
+
+                    (&mut Leaf(ref mut p), &mut Leaf(ref mut s)) => {
+                        p.remove(key); // TODO return this
+                        if is_right {
+                            p.merge(s, parent.keys()[slot - 1]);
+                        } else {
+                            s.merge(p, parent.keys()[slot - 1]);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                // FIXME free
+
+                last_parent_slot = Some(slot);
+            } else {
+                // easy mode
+                match *page {
+                    Inner(ref mut i) => i.remove_idx(last_parent_slot.unwrap()).1,
+                    Leaf(ref mut l) => l.remove(key),
+                }; // FIXME
+                return;
+            }
+        }
+
+        // there is no sibling -> eat root
+        let mut root = parent;
+        assert!(iter.next().is_none());
+        match *root {
+            Inner(..) => (),
+            Leaf(..) => unreachable!(),
+        }
+        *root = mem::replace(&mut *newroot, unsafe { mem::uninitialized() });
+        drop(root);
+        drop(newroot);
+        self.remove(key);
+        // FIXME self.mapping.free(
+        return;
     }
 
     /// Descends to the node (readlocks) containing the given key, then
@@ -184,6 +293,13 @@ impl BTreePageInner {
         }
     }
 
+    fn half_full(&self) -> bool {
+        match self {
+            &Inner(ref i) => i.half_full(),
+            &Leaf(ref l) => l.half_full(),
+        }
+    }
+
     fn traverse(&self, key: u64) -> Option<PageId> {
         match *self {
             Inner(ref i) => Some(i.traverse(key)),
@@ -201,6 +317,7 @@ mod tests {
     use super::*;
     use extensiblemapping::PAGESZ;
     use std::fs::OpenOptions;
+    use rand::{Rng, XorShiftRng};
 
     #[test]
     fn page_size() {
@@ -222,33 +339,29 @@ mod tests {
     fn it_works() {
         let mut file = OpenOptions::new().read(true).write(true).open("/tmp/btree.bin").unwrap();
         ExtensibleMapping::initialize(&mut file);
-        let mut tree = MappedBTree::open(file);
-        assert_eq!(tree.mapping.alloc(), 1);
+        let tree = MappedBTree::open(file);
+        assert_eq!(tree.mapping.alloc(), 1); // FIXME
 
-        let mut prealloc = Vec::new();
-        for i in 0..50 {
-            prealloc.push(tree.mapping.alloc());
-        }
-        for i in prealloc {
-            tree.mapping.free(i);
-        }
+        let range = 1..4096;
 
-        for i in 1..4096 {
+        for i in range.clone() {
             assert_eq!(tree.get(i), None, "{}", i);
             tree.insert(i, 1337 + i);
             assert_eq!(tree.get(i), Some(1337 + i));
         }
 
-        if false
-        {
-            fn is_full(page: &BTreePageInner) -> bool {
-                match page {
-                    &Inner(ref i) => i.full(),
-                    &Leaf(ref l) => l.full(),
-                }
-            }
-            let lock = tree.page(2).unwrap().read();
-            assert!(is_full(&*lock));
+        for i in range.clone() {
+            assert_eq!(tree.get(i), Some(1337 + i));
+        }
+
+
+        let mut values: Vec<_> = range.collect();
+        XorShiftRng::new_unseeded().shuffle(&mut values);
+
+        for i in values {
+            assert_eq!(tree.get(i), Some(1337 + i));
+            tree.remove(i);
+            assert_eq!(tree.get(i), None);
         }
     }
 }

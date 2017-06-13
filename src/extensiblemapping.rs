@@ -17,7 +17,7 @@ fn do_mmap(fd: c_int, offset: off_t, length: usize, fixed_addr: Option<usize>) -
              MAP_SHARED,
              fd, offset)
     };
-    
+
     if ret == MAP_FAILED {
         None
     } else {
@@ -46,7 +46,7 @@ impl Fragment {
         let addr_desired = self.addr + size as usize * PAGESZ;
 
         let addr = do_mmap(file.as_raw_fd(),
-                           (size as usize * PAGESZ) as i64,
+                           ((self.offset + size) as usize * PAGESZ) as i64,
                            additional as usize * PAGESZ,
                            Some(addr_desired)).unwrap();
         if addr == addr_desired {
@@ -88,23 +88,23 @@ impl ExtensibleMapping {
             _pad_end: [0; HEADER_PAD_END],
         };
         assert_eq!(mem::size_of_val(&header), PAGESZ);
-        
+
         let buffer = (&header) as *const _ as *const [u8; PAGESZ];
         file.set_len(0).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(unsafe { &*buffer }).unwrap();
         file.write_all(&[0u8; PAGESZ]).unwrap();
     }
-    
+
     pub fn open(file: File) -> ExtensibleMapping {
         let len = file.metadata().unwrap().len();
         assert!(len <= usize::MAX as u64);
 
         let size = len / (PAGESZ as u64); // round down to full pages
         assert!(size > 0);
-        
+
         let addr = do_mmap(file.as_raw_fd(), 0, size as usize * PAGESZ, None).unwrap();
-        
+
         ExtensibleMapping {
             file,
             header_ptr: addr as *mut _,
@@ -143,7 +143,7 @@ impl ExtensibleMapping {
                 }
             }
             drop(m_fragments);
-            
+
             fragments = self.fragments.read();
         }
 
@@ -156,7 +156,7 @@ impl ExtensibleMapping {
         assert_eq!(PAGESZ, mem::size_of::<T>());
         self.page(id).map(|x| &mut *(x as *mut T))
     }
-    
+
     pub fn double_file(&self) {
         let header = self.header();
         header.resize_lock.acquire();
@@ -181,7 +181,7 @@ impl ExtensibleMapping {
             while first_free != last_free {
                 last_free -= 1;
                 let pid = last_free;
-                
+
                 let page: &mut FreelistPage = unsafe { self.page_mut(pid).unwrap() };
                 page.n_entries = cmp::min(last_free - first_free, FREELIST_E_PER_PAGE as u64);
                 for (i, e) in page.entries.iter_mut().enumerate().take(page.n_entries as usize) {
@@ -204,6 +204,8 @@ impl ExtensibleMapping {
             }
         }
         self.header().alloc_lock.release();
+
+        unsafe { ptr::write_bytes(self.page(ret).unwrap(), 0, 1) };
         ret
     }
 
@@ -225,7 +227,7 @@ impl ExtensibleMapping {
                 return;
             }
         }
-        
+
         // link in at front
         let freelist: &mut FreelistPage = unsafe { self.page_mut(id) }.unwrap();
         freelist.n_entries = 0;
@@ -282,12 +284,12 @@ fn clear_page(_: usize) {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
-    
+
     #[test]
     fn it_works() {
         let mut file = OpenOptions::new().read(true).write(true).open("map.bin").unwrap();
         ExtensibleMapping::initialize(&mut file);
-        let mut mapping = ExtensibleMapping::open(file);
+        let mapping = ExtensibleMapping::open(file);
 
         assert_eq!(mapping.header().size, 2);
         assert_eq!(mapping.alloc(), 1);
@@ -307,5 +309,29 @@ mod tests {
         assert_eq!(mapping.header().size, 4);
         assert_eq!(mapping.alloc(), 4);
         assert_eq!(mapping.header().size, 8);
+    }
+
+    #[test]
+    fn it_doesnt_bug() {
+        let mut file = OpenOptions::new().read(true).write(true).open("map2.bin").unwrap();
+        ExtensibleMapping::initialize(&mut file);
+        let mapping = ExtensibleMapping::open(file);
+
+        let mut allocs = Vec::new();
+        for _ in 0..128 {
+            let alloc = mapping.alloc();
+            assert!(!allocs.contains(&alloc));
+            allocs.push(alloc);
+        }
+
+        for alloc in allocs.drain(..) {
+            mapping.free(alloc);
+        }
+
+        for _ in 0..129 {
+            let alloc = mapping.alloc();
+            assert!(!allocs.contains(&alloc));
+            allocs.push(alloc);
+        }
     }
 }
