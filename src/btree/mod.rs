@@ -78,7 +78,7 @@ impl MappedBTree {
             // root page always has to contain the root node
             // so we juggle the old root node to a new page
             let mut newpagel = self.page(newpagel_id).unwrap().write();
-            *newpagel = mem::replace(&mut *page, unsafe { mem::zeroed() });
+            *newpagel = mem::replace(&mut *page, unsafe { mem::uninitialized() });
             // from there, split it to the other new page
             self.split_into(&mut key, val, page_ref, &mut *newpagel, newpager_id);
             // and finally create a new root node from scratch
@@ -93,15 +93,27 @@ impl MappedBTree {
         }
     }
 
-    pub fn remove(&self, key: u64) {
+    pub fn remove(&self, key: u64) -> Option<u64> {
         // FIXME: this is pessimistic - most of these locks are wasted when we can just
         //        borrow from siblings (avg case)
         let (wpath, hit_root) = self.wlock_subtree(key, |x| !x.half_full());
+
+        // first check if the element even exists
+        // bailing out later is kinda hard
+        match **wpath.last().unwrap() {
+            Inner(..) => unreachable!(),
+            Leaf(ref l) => {
+                if l.keys().binary_search(&key).is_err() {
+                    return None;
+                }
+            }
+        }
 
         let mut iter = wpath.into_iter().rev();
         let mut parent = iter.next().unwrap();
         let mut last_parent_slot = None;
         let mut newroot;
+        let mut ret = None;
         loop {
             let mut page = parent;
             let nextparent = iter.next();
@@ -142,11 +154,12 @@ impl MappedBTree {
 
                         (&mut Leaf(ref mut p), &mut Leaf(ref mut s)) => {
                             p.borrow(&mut *parent, slot, s, is_right);
-                            p.remove(key); // TODO return this
+                            ret = p.remove(key); // TODO return this
                         }
                         _ => unreachable!(),
-                    }
-                    return;
+                    };
+                    assert!(ret.is_some());
+                    return ret;
                 }
 
                 if is_right {
@@ -165,7 +178,11 @@ impl MappedBTree {
                     }
 
                     (&mut Leaf(ref mut p), &mut Leaf(ref mut s)) => {
-                        p.remove(key); // TODO return this
+                        ret = p.remove(key); // TODO return this
+                        if ret.is_none() {
+                            return None;
+                        }
+
                         if is_right {
                             p.merge(s, parent.keys()[slot - 1]);
                         } else {
@@ -180,10 +197,11 @@ impl MappedBTree {
             } else {
                 // easy mode
                 match *page {
-                    Inner(ref mut i) => i.remove_idx(last_parent_slot.unwrap()).1,
-                    Leaf(ref mut l) => l.remove(key),
+                    Inner(ref mut i) => { i.remove_idx(last_parent_slot.unwrap()).1; }
+                    Leaf(ref mut l) => ret = l.remove(key),
                 }; // FIXME
-                return;
+                assert!(ret.is_some());
+                return ret;
             }
         }
 
@@ -197,9 +215,8 @@ impl MappedBTree {
         *root = mem::replace(&mut *newroot, unsafe { mem::uninitialized() });
         drop(root);
         drop(newroot);
-        self.remove(key);
+        self.remove(key)
         // FIXME self.mapping.free(
-        return;
     }
 
     /// Descends to the node (readlocks) containing the given key, then
@@ -360,7 +377,8 @@ mod tests {
 
         for i in values {
             assert_eq!(tree.get(i), Some(1337 + i));
-            tree.remove(i);
+            assert_eq!(tree.remove(i), Some(1337 + i));
+            assert_eq!(tree.remove(i), None);
             assert_eq!(tree.get(i), None);
         }
     }

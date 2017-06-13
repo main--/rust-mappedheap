@@ -20,10 +20,13 @@ pub trait Node<T> : Sized {
 
     fn insert_idx(&mut self, i: usize, key: u64, data: T);
 
-    fn remove(&mut self, key: u64) -> T {
+    fn remove(&mut self, key: u64) -> Option<T> {
         let i = self.find_slot(key);
-        assert_eq!(self.keys()[i], key);
-        self.remove_idx(i).1
+        if self.keys()[i] == key {
+            Some(self.remove_idx(i).1)
+        } else {
+            None
+        }
     }
 
     fn remove_idx(&mut self, key: usize) -> (u64, T);
