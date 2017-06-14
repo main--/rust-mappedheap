@@ -36,7 +36,7 @@ fn do_mmap(fd: c_int, offset: off_t, length: usize, fixed_addr: Option<usize>) -
 pub const PAGESZ: usize = 4096;
 const MAGIC: &[u8; 16] = b"\x89BTREE\r\n\x1a\n\n\n\n\n\n\n";
 
-pub struct ExtensibleMapping {
+pub struct MappedHeap {
     file: File,
     header_ptr: *mut FileHeader,
     fragments: RwLock<Vec<Fragment>>,
@@ -78,7 +78,7 @@ impl Drop for Fragment {
     }
 }
 
-impl ExtensibleMapping {
+impl MappedHeap {
     fn header(&self) -> &mut FileHeader {
         unsafe { &mut *self.header_ptr }
     }
@@ -100,7 +100,7 @@ impl ExtensibleMapping {
         file.write_all(&[0u8; PAGESZ]).unwrap();
     }
 
-    pub fn open<P: AsRef<Path>>(path: P) -> ExtensibleMapping {
+    pub fn open<P: AsRef<Path>>(path: P) -> MappedHeap {
         loop {
             if let Ok(file) = OpenOptions::new().read(true).write(true).open(path.as_ref()) {
                 let len = file.metadata().unwrap().len();
@@ -111,7 +111,7 @@ impl ExtensibleMapping {
 
                 let addr = do_mmap(file.as_raw_fd(), 0, size as usize * PAGESZ, None).unwrap();
 
-                return ExtensibleMapping {
+                return MappedHeap {
                     file,
                     header_ptr: addr as *mut _,
                     fragments: RwLock::new(vec![Fragment { addr, offset: 0, size: Cell::new(size) }]),
@@ -122,7 +122,7 @@ impl ExtensibleMapping {
                 let ext = path.as_ref().extension().and_then(|x| x.to_str()).unwrap();
                 let mut tmp = NamedTempFileOptions::new().prefix(stem)
                     .suffix(&format!(".{}", ext)).create_in(dir).unwrap();
-                ExtensibleMapping::initialize(&mut tmp);
+                MappedHeap::initialize(&mut tmp);
                 // ignore the result of this
                 // either we just created it
                 // or it already existed
@@ -132,7 +132,7 @@ impl ExtensibleMapping {
         }
     }
 
-    fn sanity_check(self) -> ExtensibleMapping {
+    fn sanity_check(self) -> MappedHeap {
         assert_eq!(&self.header().magic, MAGIC);
         self
     }
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn it_works() {
         let _ = fs::remove_file("/tmp/map.bin");
-        let mapping = ExtensibleMapping::open("/tmp/map.bin");
+        let mapping = MappedHeap::open("/tmp/map.bin");
 
         assert_eq!(mapping.header().size, 2);
         assert_eq!(mapping.alloc(), 1);
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn it_doesnt_bug() {
         let _ = fs::remove_file("/tmp/map2.bin");
-        let mapping = ExtensibleMapping::open("/tmp/map2.bin");
+        let mapping = MappedHeap::open("/tmp/map2.bin");
 
         let mut allocs = Vec::new();
         for _ in 0..128 {
