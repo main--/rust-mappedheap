@@ -1,5 +1,7 @@
 [package]
 name = "mappedheap"
+description = "An extensible memory mapped file that keeps track of used and free pages with a simple freelist allocator."
+license = "MIT"
 version = "0.1.0"
 authors = ["main() <main@ehvag.de>"]
 

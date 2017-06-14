@@ -1,3 +1,9 @@
+#![warn(missing_docs)]
+//! This crate provides ´MappedHeap`, an extensible memory mapped file
+//! that keeps track of used and free pages with a simple freelist allocator.
+//!
+//! For details, see the type's documentation.
+
 extern crate libc;
 extern crate futex;
 extern crate tempfile;
@@ -8,7 +14,7 @@ use libc::{mmap, munmap, PROT_READ, PROT_WRITE, MAP_SHARED, c_int, off_t, c_void
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::{mem, ptr, cmp};
+use std::{mem, ptr, cmp, io};
 use std::cell::Cell;
 use std::usize;
 use std::path::Path;
@@ -17,7 +23,7 @@ use futex::raw::Mutex;
 use futex::RwLock;
 use tempfile::NamedTempFileOptions;
 
-fn do_mmap(fd: c_int, offset: off_t, length: usize, fixed_addr: Option<usize>) -> Option<usize> {
+fn do_mmap(fd: c_int, offset: off_t, length: usize, fixed_addr: Option<usize>) -> io::Result<usize> {
     let ret = unsafe {
         mmap(fixed_addr.map(|x| x as *mut c_void).unwrap_or(ptr::null_mut()),
              length,
@@ -27,15 +33,33 @@ fn do_mmap(fd: c_int, offset: off_t, length: usize, fixed_addr: Option<usize>) -
     };
 
     if ret == MAP_FAILED {
-        None
+        Err(io::Error::last_os_error())
     } else {
-        Some(ret as usize)
+        Ok(ret as usize)
     }
 }
 
+/// The size of a page in bytes.
 pub const PAGESZ: usize = 4096;
-const MAGIC: &[u8; 16] = b"\x89BTREE\r\n\x1a\n\n\n\n\n\n\n";
+const MAGIC: &[u8; 16] = b"\x89MAPHEAP\r\n\x1a\n\n\n\n\n";
 
+/// An extensible memory mapped file that keeps track of used and free pages
+/// with a simple freelist allocator.
+///
+/// The file will grow whenever necessary. It will always doube in size to
+/// make sure resizes are rare.
+///
+/// # Example
+///
+/// ```
+/// use mappedheap::MappedHeap;
+///
+/// let mapping = MappedHeap::open("/tmp/test.bin").unwrap();
+/// let page_id = mapping.alloc();
+/// let page_ptr = mapping.page(page_id).unwrap();
+/// // do someting with page_ptr ...
+/// mapping.free(page_id);
+/// ```
 pub struct MappedHeap {
     file: File,
     header_ptr: *mut FileHeader,
@@ -56,7 +80,7 @@ impl Fragment {
         let addr = do_mmap(file.as_raw_fd(),
                            ((self.offset + size) as usize * PAGESZ) as i64,
                            additional as usize * PAGESZ,
-                           Some(addr_desired)).unwrap();
+                           Some(addr_desired)).expect("Error while trying to grow mapping");
         if addr == addr_desired {
             self.size.set(size + additional);
             None
@@ -100,43 +124,78 @@ impl MappedHeap {
         file.write_all(&[0u8; PAGESZ]).unwrap();
     }
 
-    pub fn open<P: AsRef<Path>>(path: P) -> MappedHeap {
+    /// Opens a file as a MappedHeap.
+    ///
+    /// This will panic if the file is not a valid MappedHeap.
+    pub fn open_file(file: File) -> io::Result<MappedHeap> {
+        let len = file.metadata()?.len();
+        assert!(len <= usize::MAX as u64);
+
+        let size = len / (PAGESZ as u64); // round down to full pages
+        assert!(size > 0);
+
+        let addr = do_mmap(file.as_raw_fd(), 0, size as usize * PAGESZ, None)?;
+
+        Ok(MappedHeap {
+            file,
+            header_ptr: addr as *mut _,
+            fragments: RwLock::new(vec![Fragment { addr, offset: 0, size: Cell::new(size) }]),
+        }.sanity_check())
+    }
+
+    /// Opens a file as a MappedHeap.
+    ///
+    /// This will atomically create and initialize the file if it doesn't exist.
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<MappedHeap> {
         loop {
-            if let Ok(file) = OpenOptions::new().read(true).write(true).open(path.as_ref()) {
-                let len = file.metadata().unwrap().len();
-                assert!(len <= usize::MAX as u64);
-
-                let size = len / (PAGESZ as u64); // round down to full pages
-                assert!(size > 0);
-
-                let addr = do_mmap(file.as_raw_fd(), 0, size as usize * PAGESZ, None).unwrap();
-
-                return MappedHeap {
-                    file,
-                    header_ptr: addr as *mut _,
-                    fragments: RwLock::new(vec![Fragment { addr, offset: 0, size: Cell::new(size) }]),
-                }.sanity_check();
-            } else {
-                let dir = path.as_ref().parent().unwrap();
-                let stem = path.as_ref().file_stem().and_then(|x| x.to_str()).unwrap();
-                let ext = path.as_ref().extension().and_then(|x| x.to_str()).unwrap();
-                let mut tmp = NamedTempFileOptions::new().prefix(stem)
-                    .suffix(&format!(".{}", ext)).create_in(dir).unwrap();
-                MappedHeap::initialize(&mut tmp);
-                // ignore the result of this
-                // either we just created it
-                // or it already existed
-                // either way, go loop and try to open
-                let _ = tmp.persist_noclobber(path.as_ref());
+            match OpenOptions::new().read(true).write(true).open(path.as_ref()) {
+                Ok(file) => return MappedHeap::open_file(file),
+                Err(ref x) if x.kind() == io::ErrorKind::NotFound => {
+                    let dir = path.as_ref().parent().unwrap();
+                    let stem = path.as_ref().file_stem().and_then(|x| x.to_str()).unwrap();
+                    let ext = path.as_ref().extension().and_then(|x| x.to_str()).unwrap();
+                    let mut tmp = NamedTempFileOptions::new().prefix(stem)
+                        .suffix(&format!(".{}", ext)).create_in(dir)?;
+                    MappedHeap::initialize(&mut tmp);
+                    // ignore the result of this
+                    // either we just created it
+                    // or it already existed
+                    // either way, go loop and try to open
+                    let _ = tmp.persist_noclobber(path.as_ref());
+                }
+                Err(e) => return Err(e),
             }
         }
     }
 
+    // FIXME: remove this - instead check on open and error if necessary
     fn sanity_check(self) -> MappedHeap {
         assert_eq!(&self.header().magic, MAGIC);
         self
     }
 
+    /// Retrieves a pointer to a given page by Id, if exists within the file.
+    /// The mapping is *not* guaranteed to be contiguous, thus operating out of the
+    /// bounds of the returned pointer is undefined behavior.
+    ///
+    /// Security note: This only guarantees that the returned pointer points to
+    /// memory backed by the file (and not some random other location).
+    ///
+    /// Most importantly, it does not protect you from inconsistencies caused
+    /// by misuse of this API or outside interference (someone else messing with
+    /// the file), such as:
+    ///
+    /// * The page is not allocated (or was double-free'd) - it might even contain the freelist.
+    /// * The page is in use concurrently - data races will occur.
+    /// * The page was arbitrarily modified by another application.
+    ///
+    /// **By unsafely operating on the returned pointer, it is your sole responsibility
+    /// to make sure that your code does not violate memory safety!**
+    ///
+    /// # Panics
+    ///
+    /// * If the mapping needs to be extended but the syscall fails.
+    ///   Resource exhaustion (memory limits) is the only documented case where this can happen.
     pub fn page(&self, id: PageId) -> Option<*mut [u8; PAGESZ]> {
         if id == NULL_PAGE || id >= self.header().size {
             return None;
@@ -172,7 +231,39 @@ impl MappedHeap {
         Some(((fragment.addr + (id - fragment.offset) as usize * PAGESZ) as *mut [u8; PAGESZ]))
     }
 
-    pub unsafe fn page_mut<T>(&self, id: PageId) -> Option<&mut T> {
+    /// Retrieves a reference to a given page by Id, if it exists within the file.
+    ///
+    /// Security note: This only guarantees that the returned reference points to
+    /// memory backed by the file (and not some random other location).
+    ///
+    /// Most importantly, it does not protect you from inconsistencies caused
+    /// by misues of this API or outside interference (someone else messing with
+    /// the file), such as:
+    ///
+    /// * The page is not allocated (or was double-free'd) - it might even contain the freelist.
+    /// * The page is in use concurrently - data races will occur.
+    /// * The page was arbitrarily modified by another application.
+    ///
+    /// In fact, even if you implement locking (you should!) you are still forced to
+    /// just blindly assume that no other application (that doesn't respect your locks)
+    /// is concurrently modifying the file. Whenever this assumption is violated, your
+    /// your code may invoke undefined behavior.
+    ///
+    /// **By unsafely calling this method, it is your sole responsibility
+    /// to make sure that your code does not violate memory safety!**
+    ///
+    /// # Panics
+    ///
+    /// * If T is not exactly page-sized.
+    /// * If the mapping needs to be extended but the syscall fails.
+    ///   Resource exhaustion (memory limits) is the only documented case where this can happen.
+    pub unsafe fn page_ref<T>(&self, id: PageId) -> Option<&T> {
+        assert_eq!(PAGESZ, mem::size_of::<T>());
+        self.page(id).map(|x| &*(x as *const T))
+    }
+
+    // internal convenience function - &mut T is UB in like 100% of all cases
+    unsafe fn page_mut<T>(&self, id: PageId) -> Option<&mut T> {
         assert_eq!(PAGESZ, mem::size_of::<T>());
         self.page(id).map(|x| &mut *(x as *mut T))
     }
@@ -181,10 +272,24 @@ impl MappedHeap {
         let header = self.header();
         header.resize_lock.acquire();
         header.size *= 2;
-        self.file.set_len(header.size * (PAGESZ as u64)).unwrap();
+        self.file.set_len(header.size * (PAGESZ as u64)).expect("Failed to double file size");
         header.resize_lock.release();
     }
 
+    /// Allocates a new page and returns its Id.
+    ///
+    /// This may double the file's size (if necessary).
+    ///
+    /// *Security note*: Outside interference as well as bugs in your code (see `free` for details)
+    /// may corrupt the freelist structure. In that case, while this function will not violate
+    /// memory safety, its behavior is undefined otherwise.
+    ///
+    /// # Panics
+    ///
+    /// * If the mapping needs to be extended but the syscall fails.
+    ///   Resource exhaustion (memory limits) is the only documented case where this can happen.
+    /// * If the file has to be extended but the syscall fails.
+    /// * May panic if the freelist structure is corrupt.
     pub fn alloc(&self) -> PageId {
         self.header().alloc_lock.acquire();
 
@@ -232,7 +337,27 @@ impl MappedHeap {
         ret
     }
 
+    /// Frees a page.
+    ///
+    /// Even though neither the mapping nor the file size will ever shrink,
+    /// the disk space associated with this page may be reclaimed on supported
+    /// operating and file systems (right now, only Linux is supported, have a
+    /// look at fallocate(2) for a list of file systems that support hole punching).
+    ///
+    /// *Security note*: This only checks that the given page exists - nothing else.
+    ///
+    /// Invoking this method on pages that were not previously returned by `alloc`
+    /// ("double-free") will corrupt the freelist structure.
+    /// Concurrent modification by other applications not using this API may have
+    /// the same effect. In both cases, while this function will not violate
+    /// memory safety, its behavior is undefined otherwise.
+    ///
+    /// # Panics
+    ///
+    /// * If the given page id is not valid.
+    /// * May panic if the freelist structure is corrupt.
     pub fn free(&self, id: PageId) {
+        assert!(id != NULL_PAGE);
         assert!(id < self.header().size);
 
         let header = self.header();
@@ -269,7 +394,14 @@ struct FreelistPage {
     next: PageId,
 }
 
+/// References a page.
 pub type PageId = u64;
+
+/// The null page guaranteed to always be invalid.
+///
+/// Internally, the first page (id 0) is reserved for the file header,
+/// so it is never valid in any public calls (never returned by `alloc`,
+/// never accessible through `page` etc.).
 pub const NULL_PAGE: PageId = 0;
 
 const HEADER_PAD_END: usize = PAGESZ - 64 * 3;
@@ -316,7 +448,7 @@ mod tests {
     #[test]
     fn it_works() {
         let _ = fs::remove_file("/tmp/map.bin");
-        let mapping = MappedHeap::open("/tmp/map.bin");
+        let mapping = MappedHeap::open("/tmp/map.bin").unwrap();
 
         assert_eq!(mapping.header().size, 2);
         assert_eq!(mapping.alloc(), 1);
@@ -343,7 +475,7 @@ mod tests {
     #[test]
     fn it_doesnt_bug() {
         let _ = fs::remove_file("/tmp/map2.bin");
-        let mapping = MappedHeap::open("/tmp/map2.bin");
+        let mapping = MappedHeap::open("/tmp/map2.bin").unwrap();
 
         let mut allocs = Vec::new();
         for _ in 0..128 {
