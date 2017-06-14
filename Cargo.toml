@@ -6,6 +6,7 @@ authors = ["main() <main@ehvag.de>"]
 [dependencies]
 libc = "0.2"
 futex = "0.1"
+tempfile = "2.1"
 
 [dev-dependencies]
 rand = "0.3"
