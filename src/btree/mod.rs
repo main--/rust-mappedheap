@@ -18,10 +18,17 @@ const ROOT_PAGE: PageId = 1;
 type BTreePage = RwLock<BTreePageInner>;
 
 impl MappedBTree {
+    pub fn initialize(mut file: File) -> MappedBTree {
+        ExtensibleMapping::initialize(&mut file);
+        let mapping = ExtensibleMapping::open(file);
+        assert_eq!(mapping.alloc(), ROOT_PAGE);
+        MappedBTree { mapping }
+    }
+
     pub fn open(file: File) -> MappedBTree {
-        MappedBTree {
-            mapping: ExtensibleMapping::open(file)
-        }
+        let mapping = ExtensibleMapping::open(file);
+        mapping.page(ROOT_PAGE).expect("Opened an incomplete btree! (Race?)");
+        MappedBTree { mapping }
     }
 
     fn page(&self, id: PageId) -> Option<&BTreePage> {
@@ -383,13 +390,22 @@ mod tests {
     }
 
     #[test]
-    fn it_works() {
-        let mut file = OpenOptions::new().read(true).write(true).open("/dev/shm/btree.bin").unwrap();
-        ExtensibleMapping::initialize(&mut file);
-        let tree = MappedBTree::open(file);
-        assert_eq!(tree.mapping.alloc(), 1); // FIXME
+    fn it_works_small() {
+        it_works(10000);
+    }
 
-        let range = 1..600000;
+    #[test]
+    #[ignore]
+    fn it_works_big() {
+        it_works(600000);
+    }
+
+    fn it_works(size: u64) {
+        let file = OpenOptions::new().read(true).write(true).create(true)
+            .truncate(true).open("/dev/shm/btree.bin").unwrap();
+        let tree = MappedBTree::initialize(file);
+
+        let range = 0..size;
         let mut rng = XorShiftRng::new_unseeded();
 
         let mut values: Vec<_> = range.clone().collect();
