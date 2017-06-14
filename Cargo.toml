@@ -2,7 +2,7 @@
 name = "mappedheap"
 description = "An extensible memory mapped file that keeps track of used and free pages with a simple freelist allocator."
 license = "MIT"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["main() <main@ehvag.de>"]
 
 [dependencies]

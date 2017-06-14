@@ -178,7 +178,7 @@ impl MappedHeap {
     /// The mapping is *not* guaranteed to be contiguous, thus operating out of the
     /// bounds of the returned pointer is undefined behavior.
     ///
-    /// Security note: This only guarantees that the returned pointer points to
+    /// *Security note*: This only guarantees that the returned pointer points to
     /// memory backed by the file (and not some random other location).
     ///
     /// Most importantly, it does not protect you from inconsistencies caused
@@ -233,7 +233,7 @@ impl MappedHeap {
 
     /// Retrieves a reference to a given page by Id, if it exists within the file.
     ///
-    /// Security note: This only guarantees that the returned reference points to
+    /// *Security note*: This only guarantees that the returned reference points to
     /// memory backed by the file (and not some random other location).
     ///
     /// Most importantly, it does not protect you from inconsistencies caused
